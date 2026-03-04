@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+import math
 from typing import Literal
 
 from .models import AthleteRow, GroupBlock, format_seconds
@@ -56,15 +57,16 @@ class LiveGroupTracker:
                 completed.append(group)
         return completed
 
-    def register_seen_results(self, groups: tuple[GroupBlock, ...], now: datetime) -> None:
-        for group in groups:
-            for athlete in group.athletes:
-                if not athlete.run1.is_empty:
-                    key = (athlete.sheet_name, 1, athlete.athlete_key)
-                    self._result_seen_at.setdefault(key, now)
-                if not athlete.run2.is_empty:
-                    key = (athlete.sheet_name, 2, athlete.athlete_key)
-                    self._result_seen_at.setdefault(key, now)
+    def register_result_updates(self, changed_athletes: list[AthleteRow], now: datetime) -> None:
+        # Track only truly new updates after script start.
+        # Existing values from initial snapshot must not distort pace model.
+        for athlete in changed_athletes:
+            if not athlete.run1.is_empty:
+                key = (athlete.sheet_name, 1, athlete.athlete_key)
+                self._result_seen_at.setdefault(key, now)
+            if not athlete.run2.is_empty:
+                key = (athlete.sheet_name, 2, athlete.athlete_key)
+                self._result_seen_at.setdefault(key, now)
 
     def estimate_result_time(
         self,
@@ -81,38 +83,85 @@ class LiveGroupTracker:
             return None
         if run_number == 2 and not target.run2.is_empty:
             return None
-
-        completed = [
-            athlete
-            for athlete in sheet_athletes
-            if (run_number == 1 and not athlete.run1.is_empty) or (run_number == 2 and not athlete.run2.is_empty)
-        ]
-        if len(completed) < 2:
+        if run_number == 2 and not _is_eligible_for_run2(target):
             return None
 
-        seen_times = [
-            self._result_seen_at.get((sheet_name, run_number, athlete.athlete_key))
-            for athlete in completed
-        ]
-        known = [ts for ts in seen_times if ts is not None]
-        if len(known) < 2:
-            return None
-
-        total_interval = (max(known) - min(known)).total_seconds()
-        avg_interval = total_interval / (len(known) - 1)
-        if avg_interval <= 0:
-            return None
-
+        athletes_for_queue = (
+            tuple(athlete for athlete in sheet_athletes if _is_eligible_for_run2(athlete))
+            if run_number == 2
+            else sheet_athletes
+        )
         waiting = [
             athlete
-            for athlete in sheet_athletes
+            for athlete in athletes_for_queue
             if (run_number == 1 and athlete.run1.is_empty) or (run_number == 2 and athlete.run2.is_empty)
         ]
         queue_index = next((index for index, athlete in enumerate(waiting) if athlete.athlete_key == athlete_key), None)
         if queue_index is None:
             return None
 
-        seconds_until = (queue_index + 1) * avg_interval
+        valid_time_values = [
+            athlete.run1.seconds
+            for athlete in athletes_for_queue
+            if run_number == 1 and athlete.run1.is_time and athlete.run1.seconds is not None
+        ]
+        if run_number == 2:
+            valid_time_values = [
+                athlete.run2.seconds
+                for athlete in athletes_for_queue
+                if athlete.run2.is_time and athlete.run2.seconds is not None
+            ]
+
+        if not valid_time_values:
+            return None
+
+        # Initial tempo model at run start:
+        # first valid time / 2 (parallel occupancy on track).
+        first_valid_time = valid_time_values[0]
+        base_tempo_seconds = first_valid_time / 2.0
+
+        # Simplified model near start window (<5 athletes before target):
+        # current average run time / 2.
+        if queue_index < 5:
+            avg_run_time = sum(valid_time_values) / len(valid_time_values)
+            tempo_seconds = avg_run_time / 2.0
+            seconds_until = max(tempo_seconds * queue_index, 0.0)
+            return now + timedelta(seconds=seconds_until)
+
+        completed = [
+            athlete
+            for athlete in athletes_for_queue
+            if (run_number == 1 and not athlete.run1.is_empty) or (run_number == 2 and not athlete.run2.is_empty)
+        ]
+        seen_times = [
+            self._result_seen_at.get((sheet_name, run_number, athlete.athlete_key))
+            for athlete in completed
+        ]
+        known = sorted(ts for ts in seen_times if ts is not None)
+        tempo_seconds = base_tempo_seconds
+
+        if len(known) >= 3:
+            intervals = [
+                (known[index + 1] - known[index]).total_seconds()
+                for index in range(len(known) - 1)
+            ]
+            # Filter out operator pauses / batch input spikes.
+            positive_intervals = [
+                interval
+                for interval in intervals
+                if (interval > 0.1) and (interval <= base_tempo_seconds * 2.5)
+            ]
+            if positive_intervals:
+                observed_interval = _median(sorted(positive_intervals))
+                # Keep observed pace as correction around base model, not full replacement.
+                lower = base_tempo_seconds * 0.55
+                upper = base_tempo_seconds * 1.60
+                observed_interval = min(max(observed_interval, lower), upper)
+                # Gradually enrich base model with observed pace.
+                observed_weight = min(len(positive_intervals), 6) / 6.0
+                tempo_seconds = (base_tempo_seconds * (1.0 - observed_weight)) + (observed_interval * observed_weight)
+
+        seconds_until = max(tempo_seconds * queue_index, 0.0)
         return now + timedelta(seconds=seconds_until)
 
     def should_render_global_club_stats(self, groups: tuple[GroupBlock, ...]) -> bool:
@@ -161,6 +210,23 @@ def build_sheet_progress(groups: tuple[GroupBlock, ...]) -> dict[str, SheetProgr
             current_run=current_run,
         )
     return progress
+
+
+def group_phase(group: GroupBlock) -> SheetPhase:
+    run1_started = any(not athlete.run1.is_empty for athlete in group.athletes)
+    run1_completed = all(not athlete.run1.is_empty for athlete in group.athletes) if group.athletes else False
+    run2_started = any(not athlete.run2.is_empty for athlete in group.athletes)
+    completed = all(athlete.is_finished() for athlete in group.athletes) if group.athletes else False
+
+    if completed:
+        return "completed"
+    if run2_started:
+        return "run2"
+    if run1_started and run1_completed:
+        return "break_after_run1"
+    if run1_started:
+        return "run1"
+    return "not_started"
 
 
 def render_change_lines(changed_athletes: list[AthleteRow]) -> list[str]:
@@ -306,7 +372,7 @@ def render_group_table(group: GroupBlock, header: str, analytics: GroupAnalytics
 def build_group_analytics(group: GroupBlock, sheet_phase: SheetPhase) -> GroupAnalytics | None:
     if sheet_phase == "break_after_run1":
         return _build_run1_gap_analytics(group)
-    if sheet_phase in {"run2", "completed"}:
+    if sheet_phase == "completed":
         return _build_run2_analytics(group)
     return None
 
@@ -315,18 +381,35 @@ def _build_run1_gap_analytics(group: GroupBlock) -> GroupAnalytics | None:
     if not all(not athlete.run1.is_empty for athlete in group.athletes):
         return None
 
-    run1_times = [athlete.run1.seconds for athlete in group.athletes if athlete.run1.is_time and athlete.run1.seconds is not None]
-    leader = min(run1_times) if run1_times else None
-    values_by_athlete: dict[str, tuple[str, str]] = {}
+    sigma = _estimate_run2_sigma(group.athletes)
+    run1_ranked_times = sorted(
+        [
+            athlete
+            for athlete in group.athletes
+            if athlete.run1.is_time and athlete.run1.seconds is not None
+        ],
+        key=lambda athlete: (athlete.run1.seconds if athlete.run1.seconds is not None else float("inf"), athlete.start_number),
+    )
+    place_by_key = {
+        athlete.athlete_key: place
+        for place, athlete in enumerate(run1_ranked_times, start=1)
+    }
+    values_by_athlete: dict[str, tuple[str, ...]] = {}
 
     for athlete in group.athletes:
-        if leader is None or not athlete.run1.is_time or athlete.run1.seconds is None:
-            values_by_athlete[athlete.athlete_key] = ("-", "STATUS")
+        if not athlete.run1.is_time or athlete.run1.seconds is None:
+            values_by_athlete[athlete.athlete_key] = ("STATUS",)
             continue
-        gap = max(athlete.run1.seconds - leader, 0.0)
-        values_by_athlete[athlete.athlete_key] = (f"+{format_seconds(gap)}", _run1_segment_label(gap))
+        values_by_athlete[athlete.athlete_key] = (
+            _run1_battle_segment(
+                athlete=athlete,
+                run1_ranked=run1_ranked_times,
+                place=place_by_key.get(athlete.athlete_key, 0),
+                sigma=sigma,
+            ),
+        )
 
-    return GroupAnalytics(headers=("отст.1", "сегмент1"), values_by_athlete=values_by_athlete)
+    return GroupAnalytics(headers=("сегмент1",), values_by_athlete=values_by_athlete)
 
 
 def _build_run2_analytics(group: GroupBlock) -> GroupAnalytics:
@@ -348,6 +431,7 @@ def _build_run2_analytics(group: GroupBlock) -> GroupAnalytics:
         p1 = run1_place.get(athlete.athlete_key)
         p2 = run2_place.get(athlete.athlete_key)
         delta = (p1 - p2) if p1 is not None and p2 is not None else None
+        delta_display = f"{delta:+d}" if delta is not None else "-"
 
         include = (
             athlete.athlete_key in top6_run1
@@ -356,15 +440,15 @@ def _build_run2_analytics(group: GroupBlock) -> GroupAnalytics:
             or (delta is not None and abs(delta) > 7)
         )
         if not include:
-            values_by_athlete[athlete.athlete_key] = (str(p1) if p1 is not None else "-", "-", "-")
+            values_by_athlete[athlete.athlete_key] = (str(p1) if p1 is not None else "-", delta_display, "-")
             continue
 
         if athlete.effective_total().is_status:
-            values_by_athlete[athlete.athlete_key] = (str(p1) if p1 is not None else "-", "-", "-")
+            values_by_athlete[athlete.athlete_key] = (str(p1) if p1 is not None else "-", delta_display, "-")
             continue
 
         if not athlete.has_second_run_result():
-            values_by_athlete[athlete.athlete_key] = (str(p1) if p1 is not None else "-", "-", "Ожидает 2 заезд")
+            values_by_athlete[athlete.athlete_key] = (str(p1) if p1 is not None else "-", delta_display, "Ожидает 2 заезд")
             continue
 
         notes: list[str] = []
@@ -383,7 +467,6 @@ def _build_run2_analytics(group: GroupBlock) -> GroupAnalytics:
         if athlete.athlete_key in best_run2:
             notes.append("Лучшее время второго заезда")
 
-        delta_display = f"{delta:+d}" if delta is not None else "-"
         values_by_athlete[athlete.athlete_key] = (
             str(p1) if p1 is not None else "-",
             delta_display,
@@ -409,9 +492,12 @@ def render_group_club_stats(group: GroupBlock) -> list[str]:
             "top10": 0,
         }
     )
+    club_labels: dict[str, str] = {}
 
     for athlete in group.athletes:
-        club_stats = stats[athlete.club]
+        club_key = _normalize_club_key(athlete.club)
+        club_labels[club_key] = _preferred_club_label(club_labels.get(club_key), athlete.club)
+        club_stats = stats[club_key]
         club_stats["participants"] += 1
 
         final_value = athlete.effective_total()
@@ -431,9 +517,10 @@ def render_group_club_stats(group: GroupBlock) -> list[str]:
         if place is not None and place <= 10:
             club_stats["top10"] += 1
 
+    display_stats = {club_labels[key]: value for key, value in stats.items()}
     return _render_club_stats_table(
         title=f"Статистика по клубам: {group.sheet_name} -> {group.group_name}",
-        stats=stats,
+        stats=display_stats,
     )
 
 
@@ -448,15 +535,22 @@ def render_overall_club_stats(groups: tuple[GroupBlock, ...]) -> list[str]:
             "sum_time": 0.0,
             "top3": 0,
             "top10": 0,
+            "top10_finishers": 0,
+            "top10_sum_time": 0.0,
+            "top25pct": 0,
+            "top50pct": 0,
         }
     )
+    club_labels: dict[str, str] = {}
 
     for group in groups:
         ranking = rank_group(group.athletes)
         place_by_key = {athlete.athlete_key: place for place, athlete, _ in ranking}
 
         for athlete in group.athletes:
-            club_stats = stats[athlete.club]
+            club_key = _normalize_club_key(athlete.club)
+            club_labels[club_key] = _preferred_club_label(club_labels.get(club_key), athlete.club)
+            club_stats = stats[club_key]
             club_stats["participants"] += 1
 
             final_value = athlete.effective_total()
@@ -475,8 +569,29 @@ def render_overall_club_stats(groups: tuple[GroupBlock, ...]) -> list[str]:
                 club_stats["top3"] += 1
             if place is not None and place <= 10:
                 club_stats["top10"] += 1
+                if final_value.is_time and final_value.seconds is not None:
+                    club_stats["top10_finishers"] += 1
+                    club_stats["top10_sum_time"] += final_value.seconds
 
-    return _render_club_stats_table(title="Сводная статистика по всем клубам", stats=stats)
+        # Group-relative bands among finishers only.
+        finishers_ranked = [
+            athlete
+            for _, athlete, _ in ranking
+            if athlete.effective_total().is_time and athlete.effective_total().seconds is not None
+        ]
+        fin_count = len(finishers_ranked)
+        if fin_count > 0:
+            top25_limit = max(1, math.ceil(fin_count * 0.25))
+            top50_limit = max(1, math.ceil(fin_count * 0.50))
+            for index, athlete in enumerate(finishers_ranked, start=1):
+                club_key = _normalize_club_key(athlete.club)
+                if index <= top25_limit:
+                    stats[club_key]["top25pct"] += 1
+                if index <= top50_limit:
+                    stats[club_key]["top50pct"] += 1
+
+    display_stats = {club_labels[key]: value for key, value in stats.items()}
+    return _render_overall_club_stats_table(title="Сводная статистика по всем клубам", stats=display_stats)
 
 
 def rank_group(athletes: tuple[AthleteRow, ...]) -> list[tuple[int, AthleteRow, float | None]]:
@@ -551,6 +666,131 @@ def _run1_segment_label(gap_seconds: float) -> str:
     return "3.01+"
 
 
+def _estimate_run2_sigma(athletes: tuple[AthleteRow, ...]) -> float:
+    times = sorted(
+        athlete.run1.seconds
+        for athlete in athletes
+        if athlete.run1.is_time and athlete.run1.seconds is not None
+    )
+    if len(times) < 4:
+        return 0.80
+    median = _median(times)
+    deviations = sorted(abs(value - median) for value in times)
+    mad = _median(deviations)
+    sigma = 1.4826 * mad
+    return min(max(sigma, 0.35), 1.80)
+
+
+def _run1_battle_segment(
+    athlete: AthleteRow,
+    run1_ranked: list[AthleteRow],
+    place: int,
+    sigma: float,
+) -> str:
+    if not athlete.run1.is_time or athlete.run1.seconds is None or place <= 0:
+        return "STATUS"
+    if len(run1_ranked) < 3:
+        return "Борьба не определена"
+
+    index = place - 1
+    athlete_time = athlete.run1.seconds
+
+    ahead = run1_ranked[:index]
+    behind = run1_ranked[index + 1 :]
+
+    gain_score = 0.0
+    for rival in ahead[-5:]:
+        if rival.run1.seconds is None:
+            continue
+        gap = athlete_time - rival.run1.seconds
+        gain_score += _win_probability(gap, sigma)
+
+    loss_score = 0.0
+    for rival in behind[:5]:
+        if rival.run1.seconds is None:
+            continue
+        gap = rival.run1.seconds - athlete_time
+        loss_score += _win_probability(gap, sigma)
+
+    net_shift = gain_score - loss_score
+    likely_place = max(1, min(len(run1_ranked), int(round(place - net_shift))))
+
+    gap_up: float | None = None
+    nearest_up_prob = 0.0
+    if index > 0 and run1_ranked[index - 1].run1.seconds is not None:
+        gap_up = athlete_time - float(run1_ranked[index - 1].run1.seconds)
+        nearest_up_prob = _win_probability(gap_up, sigma)
+
+    gap_down: float | None = None
+    nearest_down_prob = 0.0
+    if index < len(run1_ranked) - 1 and run1_ranked[index + 1].run1.seconds is not None:
+        gap_down = float(run1_ranked[index + 1].run1.seconds) - athlete_time
+        nearest_down_prob = _win_probability(gap_down, sigma)
+
+    tight_gap = max(1.0, 1.1 * sigma)
+    comfort_gap = max(1.8, 2.2 * sigma)
+    dominant_gap = max(2.8, 3.0 * sigma)
+    is_pressure = (gap_down is not None and gap_down <= tight_gap) or nearest_down_prob >= 0.42
+    is_comfort = (gap_down is not None and gap_down >= comfort_gap) and nearest_down_prob <= 0.28
+
+    if place == 1:
+        if gap_down is not None and gap_down >= dominant_gap and nearest_down_prob <= 0.15:
+            base = "Лидер с комфортным преимуществом"
+        elif is_pressure:
+            base = "Лидер под давлением"
+        else:
+            base = "Лидер с рабочим запасом"
+    elif place <= 3:
+        if is_comfort:
+            base = "Подиум: комфортное преимущество"
+        elif net_shift >= 0.4 and gap_up is not None and gap_up <= comfort_gap:
+            base = "Подиум: шанс усилить позицию"
+        elif is_pressure or loss_score >= 0.8:
+            base = "Подиум: риск потери"
+        else:
+            base = "Подиум: стабильная позиция"
+    elif place <= 10:
+        if is_pressure:
+            base = "Топ-10: зона давления"
+        elif is_comfort:
+            base = "Топ-10: позиция с запасом"
+        elif net_shift >= 0.8 and gap_up is not None and gap_up <= comfort_gap:
+            base = "Топ-10: шанс отыгрыша"
+        else:
+            base = "Топ-10: стабильная зона"
+    else:
+        if is_comfort:
+            base = "Стабильная позиция с запасом"
+        elif net_shift >= 1.2 and gap_up is not None and gap_up <= comfort_gap:
+            base = "Высокий шанс отыгрыша"
+        elif net_shift >= 0.5 and gap_up is not None and gap_up <= comfort_gap:
+            base = "Вероятный отыгрыш"
+        elif is_pressure or loss_score >= 1.2:
+            base = "Риск потери позиций"
+        else:
+            base = "Стабильная позиция"
+
+    return (
+        f"{base}; прогн.место: {likely_place}; "
+        f"P↑:{nearest_up_prob * 100:.0f}% P↓:{nearest_down_prob * 100:.0f}%"
+    )
+
+
+def _win_probability(gap_seconds: float, sigma: float) -> float:
+    sigma = max(sigma, 0.10)
+    z = gap_seconds / (2.0 * sigma)
+    return 0.5 * math.erfc(z)
+
+
+def _median(values: list[float]) -> float:
+    if not values:
+        return 0.0
+    middle = len(values) // 2
+    if len(values) % 2 == 1:
+        return values[middle]
+    return (values[middle - 1] + values[middle]) / 2.0
+
+
 def _render_club_stats_table(title: str, stats: dict[str, dict[str, float | int]]) -> list[str]:
     headers = ("клуб", "уч.", "финиш", "DNS", "DNF", "DSQ", "ср.итог", "топ3", "топ10")
     rows: list[tuple[str, ...]] = []
@@ -591,7 +831,145 @@ def _render_club_stats_table(title: str, stats: dict[str, dict[str, float | int]
         return " | ".join(rendered)
 
     lines = ["", title, _fmt(headers), "-+-".join("-" * width for width in widths)]
-    lines.extend(_fmt(row) for row in rows)
+    for row in rows:
+        lines.append(_highlight_if_kanaev(row[0], _fmt(row)))
+    return lines
+
+
+def _render_overall_club_stats_table(title: str, stats: dict[str, dict[str, float | int]]) -> list[str]:
+    headers = (
+        "клуб",
+        "уч.",
+        "финиш",
+        "DNS",
+        "DNF",
+        "DSQ",
+        "топ3",
+        "топ10",
+        "топ25%",
+        "топ50%",
+        "среднее время",
+        "среднее время в топ10",
+        "скоринг",
+    )
+    rows: list[tuple[str, ...]] = []
+
+    total_participants = sum(int(data["participants"]) for data in stats.values())
+    total_finishers = sum(int(data["finishers"]) for data in stats.values())
+    total_top3 = sum(int(data["top3"]) for data in stats.values())
+    total_top10 = sum(int(data["top10"]) for data in stats.values())
+    global_finish_rate = (total_finishers / total_participants) if total_participants else 0.0
+    global_top3_rate = (total_top3 / total_participants) if total_participants else 0.0
+    global_top10_rate = (total_top10 / total_participants) if total_participants else 0.0
+
+    avg_by_club: dict[str, float] = {}
+    top10_avg_by_club: dict[str, float] = {}
+    for club, data in stats.items():
+        finishers = int(data["finishers"])
+        if finishers > 0:
+            avg_by_club[club] = float(data["sum_time"]) / finishers
+        top10_finishers = int(data["top10_finishers"])
+        if top10_finishers > 0:
+            top10_avg_by_club[club] = float(data["top10_sum_time"]) / top10_finishers
+    best_avg = min(avg_by_club.values()) if avg_by_club else None
+    best_top10_avg = min(top10_avg_by_club.values()) if top10_avg_by_club else None
+
+    scored: list[tuple[str, tuple[str, ...]]] = []
+    for club, data in stats.items():
+        participants = int(data["participants"])
+        finishers = int(data["finishers"])
+        dns = int(data["dns"])
+        dnf = int(data["dnf"])
+        dsq = int(data["dsq"])
+        top3 = int(data["top3"])
+        top10 = int(data["top10"])
+        top25pct = int(data["top25pct"])
+        top50pct = int(data["top50pct"])
+
+        finish_rate = (finishers / participants) if participants else 0.0
+        podium_rate = (top3 / participants) if participants else 0.0
+        top10_rate = (top10 / participants) if participants else 0.0
+        if best_avg is not None and club in avg_by_club and avg_by_club[club] > 0:
+            speed_index = best_avg / avg_by_club[club]
+            avg_display = f"{format_seconds(avg_by_club[club])} ({speed_index * 100:.1f}%)"
+        else:
+            speed_index = 0.0
+            avg_display = "- (0.0%)"
+
+        if best_top10_avg is not None and club in top10_avg_by_club and top10_avg_by_club[club] > 0:
+            top10_speed_index = best_top10_avg / top10_avg_by_club[club]
+            top10_avg_display = f"{format_seconds(top10_avg_by_club[club])} ({top10_speed_index * 100:.1f}%)"
+        else:
+            top10_speed_index = 0.0
+            top10_avg_display = "- (0.0%)"
+
+        # Empirical-Bayes smoothing reduces sample-size volatility.
+        prior_strength = 12.0
+        smoothed_finish_rate = ((finishers + (prior_strength * global_finish_rate)) / (participants + prior_strength)) if (participants + prior_strength) > 0 else 0.0
+        smoothed_podium_rate = ((top3 + (prior_strength * global_top3_rate)) / (participants + prior_strength)) if (participants + prior_strength) > 0 else 0.0
+        smoothed_top10_rate = ((top10 + (prior_strength * global_top10_rate)) / (participants + prior_strength)) if (participants + prior_strength) > 0 else 0.0
+
+        speed_prior_strength = 8.0
+        smoothed_speed_index = (
+            ((speed_index * finishers) + speed_prior_strength) / (finishers + speed_prior_strength)
+            if (finishers + speed_prior_strength) > 0
+            else 0.0
+        )
+
+        base_score = 100.0 * (
+            0.40 * smoothed_top10_rate
+            + 0.30 * smoothed_podium_rate
+            + 0.20 * smoothed_finish_rate
+            + 0.10 * smoothed_speed_index
+        )
+
+        # Reliability compresses extremes for very small teams.
+        reliability = math.sqrt(participants / (participants + prior_strength)) if participants > 0 else 0.0
+        score = 50.0 + ((base_score - 50.0) * reliability)
+
+        score_strength = min(max(score / 100.0, 0.0), 1.0)
+        score_display = f"{score:.1f} ({score_strength * 100:.1f}%)"
+
+        row = (
+            club,
+            str(participants),
+            f"{finishers} ({finish_rate * 100:.1f}%)",
+            f"{dns} ({(dns / participants * 100.0) if participants else 0.0:.1f}%)",
+            f"{dnf} ({(dnf / participants * 100.0) if participants else 0.0:.1f}%)",
+            f"{dsq} ({(dsq / participants * 100.0) if participants else 0.0:.1f}%)",
+            f"{top3} ({(top3 / participants * 100.0) if participants else 0.0:.1f}%)",
+            f"{top10} ({(top10 / participants * 100.0) if participants else 0.0:.1f}%)",
+            f"{top25pct} ({(top25pct / finishers * 100.0) if finishers else 0.0:.1f}%)",
+            f"{top50pct} ({(top50pct / finishers * 100.0) if finishers else 0.0:.1f}%)",
+            avg_display,
+            top10_avg_display,
+            score_display,
+        )
+        scored.append((club, row))
+
+    for _, row in sorted(scored, key=lambda item: item[0].lower()):
+        rows.append(row)
+
+    widths = [len(header) for header in headers]
+    for row in rows:
+        for idx, cell in enumerate(row):
+            widths[idx] = max(widths[idx], len(cell))
+
+    def _fmt(cells: tuple[str, ...]) -> str:
+        rendered: list[str] = []
+        for idx, cell in enumerate(cells):
+            if idx == 0:
+                rendered.append(cell.ljust(widths[idx]))
+            else:
+                rendered.append(cell.rjust(widths[idx]))
+        return " | ".join(rendered)
+
+    lines = ["", title, _fmt(headers), "-+-".join("-" * width for width in widths)]
+    for row in rows:
+        lines.append(_highlight_if_kanaev(row[0], _fmt(row)))
+    lines.append("")
+    lines.append("Скоринг: 40% топ10 + 30% топ3 + 20% финиш + 10% индекс темпа.")
+    lines.append("Используется сглаживание (Bayes) и коэффициент надежности по размеру команды.")
     return lines
 
 
@@ -605,6 +983,24 @@ def _highlight_if_kanaev(club: str, text: str) -> str:
 def _is_kanaev_club(club: str) -> bool:
     normalized = " ".join(club.lower().split())
     return "канаев ски клаб" in normalized
+
+
+def _normalize_club_key(club: str) -> str:
+    return " ".join(club.lower().split())
+
+
+def _preferred_club_label(current: str | None, candidate: str) -> str:
+    normalized = " ".join(candidate.split())
+    if not current:
+        return normalized
+    if current.isupper() and not normalized.isupper():
+        return normalized
+    return current
+
+
+def _is_eligible_for_run2(athlete: AthleteRow) -> bool:
+    # Athletes with terminal status in run1 are treated as non-starters for run2 forecast queue.
+    return not athlete.run1.is_status
 
 
 def _place_word(value: int) -> str:

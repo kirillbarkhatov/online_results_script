@@ -12,6 +12,7 @@ from .db import SQLiteStore, diff_athletes
 from .live import (
     LiveGroupTracker,
     build_group_analytics,
+    group_phase,
     build_sheet_progress,
     has_result_update,
     render_change_lines,
@@ -80,7 +81,6 @@ def run() -> None:
             sheet_values = client.fetch_all_sheets()
             parsed = parse_protocol_sheets(sheet_values)
             now_ts = datetime.now()
-            tracker.register_seen_results(parsed.groups, now_ts)
             sheet_progress = build_sheet_progress(parsed.groups)
             current_snapshot = {athlete.athlete_key: athlete for athlete in parsed.athletes}
 
@@ -94,6 +94,7 @@ def run() -> None:
                     for change in changes
                     if has_result_update(change.before, change.after)
                 ]
+                tracker.register_result_updates(updated_results, now_ts)
                 change_lines = render_change_lines(updated_results)
                 if change_lines:
                     print("Обновленные результаты:")
@@ -123,7 +124,7 @@ def run() -> None:
 
                     analytics = build_group_analytics(
                         group=group,
-                        sheet_phase=progress.phase if progress else "not_started",
+                        sheet_phase=group_phase(group),
                     )
                     for line in render_group_table(group, header="Обновленная группа", analytics=analytics):
                         print(line)
@@ -133,7 +134,7 @@ def run() -> None:
                     progress = sheet_progress.get(group.sheet_name)
                     analytics = build_group_analytics(
                         group=group,
-                        sheet_phase=progress.phase if progress else "completed",
+                        sheet_phase=group_phase(group),
                     )
                     for line in render_group_table(group, header="Группа завершила старт", analytics=analytics):
                         print(line)
