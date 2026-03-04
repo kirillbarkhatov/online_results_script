@@ -1,0 +1,218 @@
+{
+  "info": {
+    "name": "Online Results API",
+    "_postman_id": "c60bc4c2-bdfa-45d4-a789-7fbbdc4d0df5",
+    "description": "Базовые тесты API онлайн-трансляции.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "item": [
+    {
+      "name": "Health",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{baseUrl}}/health",
+          "host": [
+            "{{baseUrl}}"
+          ],
+          "path": [
+            "health"
+          ]
+        }
+      }
+    },
+    {
+      "name": "Start Stream",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"protocol_link\": \"{{protocolLink}}\",\n  \"poll_interval_sec\": 1.0,\n  \"refresh_titles_every\": 120,\n  \"finalize_timeout_sec\": 300,\n  \"finalize_max_missing\": 2,\n  \"callback_url\": \"{{callbackUrl}}\",\n  \"callback_secret\": \"{{callbackSecret}}\",\n  \"worker_print\": false\n}"
+        },
+        "url": {
+          "raw": "{{baseUrl}}/v1/streams",
+          "host": [
+            "{{baseUrl}}"
+          ],
+          "path": [
+            "v1",
+            "streams"
+          ]
+        }
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('Status is 200', function () {",
+              "  pm.response.to.have.status(200);",
+              "});",
+              "const json = pm.response.json();",
+              "if (json.stream_id) {",
+              "  pm.environment.set('streamId', json.stream_id);",
+              "}"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "List Streams",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{baseUrl}}/v1/streams",
+          "host": [
+            "{{baseUrl}}"
+          ],
+          "path": [
+            "v1",
+            "streams"
+          ]
+        }
+      }
+    },
+    {
+      "name": "Get Stream",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{baseUrl}}/v1/streams/{{streamId}}",
+          "host": [
+            "{{baseUrl}}"
+          ],
+          "path": [
+            "v1",
+            "streams",
+            "{{streamId}}"
+          ]
+        }
+      }
+    },
+    {
+      "name": "Stop Stream",
+      "request": {
+        "method": "POST",
+        "header": [],
+        "url": {
+          "raw": "{{baseUrl}}/v1/streams/{{streamId}}/stop",
+          "host": [
+            "{{baseUrl}}"
+          ],
+          "path": [
+            "v1",
+            "streams",
+            "{{streamId}}",
+            "stop"
+          ]
+        }
+      }
+    },
+    {
+      "name": "SSE Events (manual in browser/curl)",
+      "request": {
+        "method": "GET",
+        "header": [
+          {
+            "key": "Accept",
+            "value": "text/event-stream"
+          }
+        ],
+        "url": {
+          "raw": "{{baseUrl}}/v1/streams/{{streamId}}/events",
+          "host": [
+            "{{baseUrl}}"
+          ],
+          "path": [
+            "v1",
+            "streams",
+            "{{streamId}}",
+            "events"
+          ]
+        },
+        "description": "Postman может не показывать поток SSE удобно. Для проверки лучше: curl -N {{baseUrl}}/v1/streams/{{streamId}}/events"
+      }
+    },
+    {
+      "name": "Results - List Events",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{baseUrl}}/v1/results/events",
+          "host": [
+            "{{baseUrl}}"
+          ],
+          "path": [
+            "v1",
+            "results",
+            "events"
+          ]
+        }
+      }
+    },
+    {
+      "name": "Results - Final By Event",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{baseUrl}}/v1/results/final?event_date={{eventDate}}&event_name={{eventName}}",
+          "host": [
+            "{{baseUrl}}"
+          ],
+          "path": [
+            "v1",
+            "results",
+            "final"
+          ],
+          "query": [
+            {
+              "key": "event_date",
+              "value": "{{eventDate}}"
+            },
+            {
+              "key": "event_name",
+              "value": "{{eventName}}"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "Results - Athlete Places",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{baseUrl}}/v1/results/athlete-places?event_name={{eventName}}",
+          "host": [
+            "{{baseUrl}}"
+          ],
+          "path": [
+            "v1",
+            "results",
+            "athlete-places"
+          ],
+          "query": [
+            {
+              "key": "event_name",
+              "value": "{{eventName}}"
+            }
+          ]
+        }
+      }
+    }
+  ]
+}

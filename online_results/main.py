@@ -4,31 +4,17 @@ import argparse
 import csv
 import os
 import re
-import time
 from collections import defaultdict
 from dataclasses import dataclass
-from datetime import datetime
 
 from dotenv import load_dotenv
 
-from .db import SQLiteStore, diff_athletes
-from .live import (
-    LiveGroupTracker,
-    build_group_analytics,
-    group_phase,
-    build_sheet_progress,
-    has_result_update,
-    render_change_lines,
-    render_group_club_stats,
-    render_group_table,
-    render_kanaev_sheet_summary,
-    render_overall_club_stats,
-    render_tick_header,
-    rank_group,
-)
+from .db import SQLiteStore
+from .live import rank_group
 from .models import AthleteRow
 from .parser import parse_protocol_sheets
 from .sheets_client import GoogleSheetsClient
+from .streaming import StreamRunConfig, run_stream
 
 ANSI_RESET = "\033[0m"
 ANSI_STATUS_WARNING = "\033[48;5;226m\033[30m"
@@ -216,104 +202,18 @@ def export_athlete_places_by_dates(sqlite_db: str, csv_path: str | None = None) 
 
 def run() -> None:
     settings = load_settings()
-    client = GoogleSheetsClient(
+    config = StreamRunConfig(
         spreadsheet_id=settings.spreadsheet_id,
         service_account_file=settings.service_account_file,
-    )
-    store = SQLiteStore(settings.sqlite_db)
-    store.init_schema()
-    tracker = LiveGroupTracker(
+        sqlite_db=settings.sqlite_db,
+        poll_interval_sec=settings.poll_interval_sec,
+        refresh_titles_every=settings.refresh_titles_every,
         finalize_timeout_sec=settings.finalize_timeout_sec,
         finalize_max_missing=settings.finalize_max_missing,
+        stop_on_completion=False,
+        console_output=True,
     )
-
-    previous_snapshot: dict[str, AthleteRow] = {}
-    ticks = 0
-    print("Старт онлайн-трансляции протокола. Интервал опроса:", settings.poll_interval_sec, "сек")
-
-    try:
-        while True:
-            ticks += 1
-            if ticks == 1 or ticks % settings.refresh_titles_every == 0:
-                client.load_sheet_titles()
-
-            sheet_values = client.fetch_all_sheets()
-            parsed = parse_protocol_sheets(sheet_values)
-            now_ts = datetime.now()
-            current_snapshot = {athlete.athlete_key: athlete for athlete in parsed.athletes}
-
-            changes = diff_athletes(previous_snapshot, current_snapshot)
-            store.persist_changes(changes)
-            updated_results = [
-                change.after
-                for change in changes
-                if has_result_update(change.before, change.after)
-            ]
-            tracker.register_result_updates(updated_results, now_ts)
-
-            effective_groups = tracker.apply_auto_finalize(parsed.groups, now_ts)
-            sheet_progress = build_sheet_progress(effective_groups)
-
-            if changes:
-                print(render_tick_header(len(changes)))
-                change_lines = render_change_lines(updated_results)
-                if change_lines:
-                    print("Обновленные результаты:")
-                    for line in change_lines:
-                        print(" -", line)
-
-                updated_group_keys = {
-                    f"{athlete.sheet_name}|{athlete.group_name}"
-                    for athlete in updated_results
-                }
-                printed_sheet_summaries: set[str] = set()
-                for group in effective_groups:
-                    if group.group_key not in updated_group_keys:
-                        continue
-                    progress = sheet_progress.get(group.sheet_name)
-                    if progress and group.sheet_name not in printed_sheet_summaries:
-                        summary_lines = render_kanaev_sheet_summary(
-                            sheet_name=group.sheet_name,
-                            groups=effective_groups,
-                            sheet_progress=progress,
-                            tracker=tracker,
-                            now=now_ts,
-                        )
-                        for line in summary_lines:
-                            print(line)
-                        printed_sheet_summaries.add(group.sheet_name)
-
-                    analytics = build_group_analytics(
-                        group=group,
-                        sheet_phase=group_phase(group),
-                    )
-                    for line in render_group_table(group, header="Обновленная группа", analytics=analytics):
-                        print(line)
-
-            completed_groups = tracker.find_newly_completed_groups(effective_groups)
-            if completed_groups and not changes:
-                print(render_tick_header(0))
-            for group in completed_groups:
-                analytics = build_group_analytics(
-                    group=group,
-                    sheet_phase=group_phase(group),
-                )
-                for line in render_group_table(group, header="Группа завершила старт", analytics=analytics):
-                    print(line)
-                for line in render_group_club_stats(group):
-                    print(line)
-
-            if tracker.should_render_global_club_stats(effective_groups):
-                if not changes and not completed_groups:
-                    print(render_tick_header(0))
-                for line in render_overall_club_stats(effective_groups):
-                    print(line)
-                tracker.mark_global_club_stats_rendered()
-
-            previous_snapshot = current_snapshot
-            time.sleep(settings.poll_interval_sec)
-    finally:
-        store.close()
+    run_stream(config=config)
 
 
 def main() -> None:
