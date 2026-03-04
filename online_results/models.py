@@ -58,6 +58,9 @@ class AthleteRow:
     run1: ParsedValue
     run2: ParsedValue
     total: ParsedValue
+    event_name: str = ""
+    event_date: str = ""
+    judge_note: str = ""
 
     def has_any_progress(self) -> bool:
         return any(not value.is_empty for value in (self.run1, self.run2, self.total))
