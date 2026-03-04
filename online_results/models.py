@@ -58,6 +58,9 @@ class AthleteRow:
     run1: ParsedValue
     run2: ParsedValue
     total: ParsedValue
+    event_name: str = ""
+    event_date: str = ""
+    judge_note: str = ""
 
     def has_any_progress(self) -> bool:
         return any(not value.is_empty for value in (self.run1, self.run2, self.total))
@@ -66,19 +69,23 @@ class AthleteRow:
         return not self.run2.is_empty
 
     def effective_total(self) -> ParsedValue:
-        if not self.total.is_empty:
-            return self.total
+        # Any status in runs must dominate the total result.
         if self.run2.is_status:
             return self.run2
         if self.run1.is_status:
             return self.run1
+        if self.total.is_status:
+            return self.total
+        if self.total.is_time:
+            return self.total
         if self.run1.is_time and self.run2.is_time and self.run1.seconds is not None and self.run2.seconds is not None:
             summed = self.run1.seconds + self.run2.seconds
             return ParsedValue(raw=format_seconds(summed), value_type="time", seconds=summed)
         return EMPTY_VALUE
 
     def is_finished(self) -> bool:
-        return self.has_second_run_result()
+        # Group completion is allowed by run2 value OR final status.
+        return self.has_second_run_result() or self.effective_total().is_status
 
     def last_passed_track(self) -> ParsedValue:
         if not self.run2.is_empty:

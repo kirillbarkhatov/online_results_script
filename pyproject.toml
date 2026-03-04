@@ -1,17 +1,16 @@
-[project]
+[tool.poetry]
 name = "online-results"
 version = "0.1.0"
 description = ""
-authors = [
-    {name = "kirillbarhatov",email = "k.s.barkhatov@gmail.com"}
-]
-requires-python = ">=3.14"
-dependencies = [
-    "google-api-python-client>=2.170.0",
-    "google-auth>=2.40.0",
-    "python-dotenv>=1.1.0",
-]
+authors = ["kirillbarhatov <k.s.barkhatov@gmail.com>"]
+readme = "README.md"
+packages = [{ include = "online_results" }]
 
+[tool.poetry.dependencies]
+python = ">=3.14"
+google-api-python-client = "^2.170.0"
+google-auth = "^2.40.0"
+python-dotenv = "^1.1.0"
 
 [build-system]
 requires = ["poetry-core>=2.0.0,<3.0.0"]
