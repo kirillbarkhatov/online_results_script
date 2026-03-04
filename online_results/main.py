@@ -4,11 +4,23 @@ import argparse
 import os
 import time
 from dataclasses import dataclass
+from datetime import datetime
 
 from dotenv import load_dotenv
 
 from .db import SQLiteStore, diff_athletes
-from .live import LiveGroupTracker, has_result_update, render_change_lines, render_group_table, render_tick_header
+from .live import (
+    LiveGroupTracker,
+    build_group_analytics,
+    build_sheet_progress,
+    has_result_update,
+    render_change_lines,
+    render_group_club_stats,
+    render_group_table,
+    render_kanaev_sheet_summary,
+    render_overall_club_stats,
+    render_tick_header,
+)
 from .models import AthleteRow
 from .parser import parse_protocol_sheets
 from .sheets_client import GoogleSheetsClient
@@ -67,6 +79,9 @@ def run() -> None:
 
             sheet_values = client.fetch_all_sheets()
             parsed = parse_protocol_sheets(sheet_values)
+            now_ts = datetime.now()
+            tracker.register_seen_results(parsed.groups, now_ts)
+            sheet_progress = build_sheet_progress(parsed.groups)
             current_snapshot = {athlete.athlete_key: athlete for athlete in parsed.athletes}
 
             changes = diff_athletes(previous_snapshot, current_snapshot)
@@ -89,16 +104,46 @@ def run() -> None:
                     f"{athlete.sheet_name}|{athlete.group_name}"
                     for athlete in updated_results
                 }
+                printed_sheet_summaries: set[str] = set()
                 for group in parsed.groups:
                     if group.group_key not in updated_group_keys:
                         continue
-                    for line in render_group_table(group, header="Обновленная группа"):
+                    progress = sheet_progress.get(group.sheet_name)
+                    if progress and group.sheet_name not in printed_sheet_summaries:
+                        summary_lines = render_kanaev_sheet_summary(
+                            sheet_name=group.sheet_name,
+                            groups=parsed.groups,
+                            sheet_progress=progress,
+                            tracker=tracker,
+                            now=now_ts,
+                        )
+                        for line in summary_lines:
+                            print(line)
+                        printed_sheet_summaries.add(group.sheet_name)
+
+                    analytics = build_group_analytics(
+                        group=group,
+                        sheet_phase=progress.phase if progress else "not_started",
+                    )
+                    for line in render_group_table(group, header="Обновленная группа", analytics=analytics):
                         print(line)
 
                 completed_groups = tracker.find_newly_completed_groups(parsed.groups)
                 for group in completed_groups:
-                    for line in render_group_table(group, header="Группа завершила старт"):
+                    progress = sheet_progress.get(group.sheet_name)
+                    analytics = build_group_analytics(
+                        group=group,
+                        sheet_phase=progress.phase if progress else "completed",
+                    )
+                    for line in render_group_table(group, header="Группа завершила старт", analytics=analytics):
                         print(line)
+                    for line in render_group_club_stats(group):
+                        print(line)
+
+                if tracker.should_render_global_club_stats(parsed.groups):
+                    for line in render_overall_club_stats(parsed.groups):
+                        print(line)
+                    tracker.mark_global_club_stats_rendered()
 
             previous_snapshot = current_snapshot
             time.sleep(settings.poll_interval_sec)
