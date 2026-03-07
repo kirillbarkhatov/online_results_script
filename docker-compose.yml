@@ -1,0 +1,23 @@
+services:
+  online-results-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: online-results-api
+    restart: unless-stopped
+    ports:
+      - "8002:8000"
+    env_file:
+      - .env
+    environment:
+      GOOGLE_SERVICE_ACCOUNT_FILE: /run/secrets/google-service-account.json
+      SQLITE_DB_PATH: /data/online_results.db
+    volumes:
+      - ./data:/data
+      - ${GOOGLE_SERVICE_ACCOUNT_FILE_HOST:-./pythonaccess-360812-8c6cba224115.json}:/run/secrets/google-service-account.json:ro
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s

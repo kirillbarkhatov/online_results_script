@@ -168,9 +168,29 @@ class SQLiteStore:
         return snapshot_id
 
     def fetch_current_groups(self) -> tuple[GroupBlock, ...]:
+        return self.fetch_current_groups_filtered()
+
+    def fetch_current_groups_filtered(
+        self,
+        event_date: str = "",
+        event_name: str = "",
+    ) -> tuple[GroupBlock, ...]:
         cursor = self._connection.cursor()
+        where_parts: list[str] = []
+        params: list[str] = []
+        if event_date.strip():
+            where_parts.append("COALESCE(a.event_date, '') = ?")
+            params.append(event_date.strip())
+        if event_name.strip():
+            where_parts.append("LOWER(COALESCE(a.event_name, '')) = LOWER(?)")
+            params.append(event_name.strip())
+
+        where_sql = ""
+        if where_parts:
+            where_sql = "WHERE " + " AND ".join(where_parts)
+
         cursor.execute(
-            """
+            f"""
             SELECT
                 a.athlete_key,
                 a.sheet_name,
@@ -186,8 +206,10 @@ class SQLiteStore:
                 COALESCE(c.total_raw, '') AS total_raw
             FROM athletes a
             LEFT JOIN current_results c ON c.athlete_key = a.athlete_key
+            {where_sql}
             ORDER BY a.sheet_name, a.group_name, a.start_number, a.sheet_row
-            """
+            """,
+            params,
         )
         grouped: "OrderedDict[str, list[AthleteRow]]" = OrderedDict()
         for row in cursor.fetchall():
@@ -218,6 +240,37 @@ class SQLiteStore:
             for group_key, athletes in grouped.items()
             if athletes
         )
+
+    def list_events(self) -> list[dict[str, object]]:
+        cursor = self._connection.cursor()
+        cursor.execute(
+            """
+            SELECT
+                COALESCE(NULLIF(event_date, ''), '') AS event_date,
+                COALESCE(NULLIF(event_name, ''), '') AS event_name,
+                COUNT(*) AS participants,
+                COUNT(DISTINCT sheet_name || '|' || group_name) AS groups,
+                MAX(updated_at) AS updated_at
+            FROM athletes
+            GROUP BY event_date, event_name
+            ORDER BY
+                CASE WHEN event_date = '' THEN 1 ELSE 0 END,
+                event_date DESC,
+                event_name COLLATE NOCASE ASC
+            """
+        )
+        result: list[dict[str, object]] = []
+        for row in cursor.fetchall():
+            result.append(
+                {
+                    "event_date": str(row["event_date"]),
+                    "event_name": str(row["event_name"]),
+                    "participants": int(row["participants"]),
+                    "groups": int(row["groups"]),
+                    "updated_at": str(row["updated_at"]),
+                }
+            )
+        return result
 
     def fetch_group_updated_dates(self) -> dict[str, str]:
         cursor = self._connection.cursor()
