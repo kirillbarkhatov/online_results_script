@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import threading
 import time
 from dataclasses import dataclass
@@ -14,6 +15,7 @@ from .live import (
     build_sheet_progress,
     group_phase,
     has_result_update,
+    rank_group,
     render_change_lines,
     render_group_club_stats,
     render_group_table,
@@ -27,6 +29,7 @@ from .sheets_client import GoogleSheetsClient
 
 
 EventSink = Callable[[str, dict[str, object]], None]
+ANSI_ESCAPE_PATTERN = re.compile(r"\x1b\[[0-9;]*m")
 
 
 @dataclass(frozen=True)
@@ -65,9 +68,15 @@ def run_stream(
         sink,
         "stream_started",
         {
+            "schema_version": 2,
             "started_at": datetime.now().isoformat(),
             "spreadsheet_id": config.spreadsheet_id,
             "poll_interval_sec": config.poll_interval_sec,
+            "data": {
+                "started_at": datetime.now().isoformat(),
+                "spreadsheet_id": config.spreadsheet_id,
+                "poll_interval_sec": config.poll_interval_sec,
+            },
         },
     )
 
@@ -77,7 +86,11 @@ def run_stream(
                 _emit(
                     sink,
                     "stream_stopped",
-                    {"stopped_at": datetime.now().isoformat(), "reason": "external_stop"},
+                    {
+                        "schema_version": 2,
+                        "stopped_at": datetime.now().isoformat(),
+                        "reason": "external_stop",
+                    },
                 )
                 return
 
@@ -108,9 +121,15 @@ def run_stream(
                     sink,
                     "tick",
                     {
+                        "schema_version": 2,
                         "ts": now_ts.isoformat(),
                         "changed_count": len(changes),
                         "updated_results": _serialize_athletes(updated_results),
+                        "data": {
+                            "tick_ts": now_ts.isoformat(),
+                            "changed_count": len(changes),
+                            "updated_results": _serialize_athletes(updated_results),
+                        },
                     },
                 )
                 change_lines = render_change_lines(updated_results)
@@ -118,7 +137,20 @@ def run_stream(
                     _out(config, "Обновленные результаты:")
                     for line in change_lines:
                         _out(config, " -", line)
-                    _emit(sink, "result_updated", {"lines": change_lines, "count": len(change_lines)})
+                    _emit(
+                        sink,
+                        "result_updated",
+                        {
+                            "schema_version": 2,
+                            "lines": change_lines,
+                            "lines_plain": _to_plain_lines(change_lines),
+                            "count": len(change_lines),
+                            "data": {
+                                "count": len(change_lines),
+                                "updated_results": _serialize_athletes(updated_results),
+                            },
+                        },
+                    )
 
                 updated_group_keys = {
                     f"{athlete.sheet_name}|{athlete.group_name}"
@@ -142,7 +174,16 @@ def run_stream(
                         _emit(
                             sink,
                             "kanaev_summary_updated",
-                            {"sheet_name": group.sheet_name, "lines": summary_lines},
+                            {
+                                "schema_version": 2,
+                                "sheet_name": group.sheet_name,
+                                "lines": summary_lines,
+                                "lines_plain": _to_plain_lines(summary_lines),
+                                "data": {
+                                    "sheet_name": group.sheet_name,
+                                    "lines_plain": _to_plain_lines(summary_lines),
+                                },
+                            },
                         )
                         printed_sheet_summaries.add(group.sheet_name)
 
@@ -157,10 +198,18 @@ def run_stream(
                         sink,
                         "group_table_updated",
                         {
+                            "schema_version": 2,
                             "group_key": group.group_key,
                             "sheet_name": group.sheet_name,
                             "group_name": group.group_name,
                             "lines": lines,
+                            "lines_plain": _to_plain_lines(lines),
+                            "data": _serialize_group_table(
+                                group=group,
+                                analytics=analytics,
+                                rendered_lines=lines,
+                                header="Обновленная группа",
+                            ),
                         },
                     )
 
@@ -182,11 +231,25 @@ def run_stream(
                     sink,
                     "group_completed",
                     {
+                        "schema_version": 2,
                         "group_key": group.group_key,
                         "sheet_name": group.sheet_name,
                         "group_name": group.group_name,
                         "table_lines": group_lines,
+                        "table_lines_plain": _to_plain_lines(group_lines),
                         "club_stats_lines": club_lines,
+                        "club_stats_lines_plain": _to_plain_lines(club_lines),
+                        "data": {
+                            "group_table": _serialize_group_table(
+                                group=group,
+                                analytics=analytics,
+                                rendered_lines=group_lines,
+                                header="Группа завершила старт",
+                            ),
+                            "club_stats": {
+                                "lines_plain": _to_plain_lines(club_lines),
+                            },
+                        },
                     },
                 )
 
@@ -201,15 +264,24 @@ def run_stream(
                     sink,
                     "overall_completed",
                     {
+                        "schema_version": 2,
                         "lines": overall_lines,
+                        "lines_plain": _to_plain_lines(overall_lines),
                         "completed_at": datetime.now().isoformat(),
+                        "data": {
+                            "lines_plain": _to_plain_lines(overall_lines),
+                            "completed_at": datetime.now().isoformat(),
+                        },
                     },
                 )
                 if config.stop_on_completion:
                     _emit(
                         sink,
                         "stream_completed",
-                        {"completed_at": datetime.now().isoformat()},
+                        {
+                            "schema_version": 2,
+                            "completed_at": datetime.now().isoformat(),
+                        },
                     )
                     return
 
@@ -220,6 +292,7 @@ def run_stream(
             sink,
             "stream_error",
             {
+                "schema_version": 2,
                 "error": str(exc),
                 "error_type": type(exc).__name__,
                 "failed_at": datetime.now().isoformat(),
@@ -272,3 +345,51 @@ def event_to_json(stream_id: str, event_type: str, payload: dict[str, object]) -
         },
         ensure_ascii=False,
     )
+
+
+def _to_plain_lines(lines: list[str]) -> list[str]:
+    plain: list[str] = []
+    for line in lines:
+        plain.append(ANSI_ESCAPE_PATTERN.sub("", line))
+    return plain
+
+
+def _serialize_group_table(
+    group: GroupBlock,
+    analytics,
+    rendered_lines: list[str],
+    header: str,
+) -> dict[str, object]:
+    ranking = rank_group(group.athletes)
+    extra_headers = analytics.headers if analytics else tuple()
+    headers = ("место", "ст.№", "ФИО", "клуб", "1 заезд", "2 заезд", "итог", "интервал") + extra_headers
+    rows: list[dict[str, object]] = []
+    for place, athlete, interval in ranking:
+        row: dict[str, object] = {
+            "place": place,
+            "athlete_key": athlete.athlete_key,
+            "start_number": athlete.start_number,
+            "full_name": athlete.full_name,
+            "club": athlete.club,
+            "run1": athlete.run1.to_display() or "-",
+            "run2": athlete.run2.to_display() or "-",
+            "total": athlete.effective_total().to_display() or "-",
+            "interval": (f"+{interval:.2f}" if interval is not None else "-"),
+            "judge_note": athlete.judge_note,
+        }
+        if analytics:
+            analytics_values = analytics.values_by_athlete.get(
+                athlete.athlete_key,
+                tuple("-" for _ in extra_headers),
+            )
+            row["analytics"] = {name: value for name, value in zip(extra_headers, analytics_values, strict=False)}
+        rows.append(row)
+    return {
+        "header": header,
+        "group_key": group.group_key,
+        "sheet_name": group.sheet_name,
+        "group_name": group.group_name,
+        "headers": list(headers),
+        "rows": rows,
+        "lines_plain": _to_plain_lines(rendered_lines),
+    }
