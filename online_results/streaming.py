@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import re
 import threading
 import time
@@ -43,6 +44,9 @@ class StreamRunConfig:
     finalize_max_missing: int
     stop_on_completion: bool = False
     console_output: bool = True
+    retry_base_sec: float = 25.0
+    retry_cap_sec: float = 45.0
+    retry_max_attempts: int = 12
 
 
 def run_stream(
@@ -63,12 +67,15 @@ def run_stream(
 
     previous_snapshot: dict[str, AthleteRow] = {}
     ticks = 0
+    consecutive_fetch_errors = 0
+    snapshot_emitted = False
+    last_forecast_hash = ""
     _out(config, "Старт онлайн-трансляции протокола. Интервал опроса:", config.poll_interval_sec, "сек")
     _emit(
         sink,
         "stream_started",
         {
-            "schema_version": 2,
+            "schema_version": 3,
             "started_at": datetime.now().isoformat(),
             "spreadsheet_id": config.spreadsheet_id,
             "poll_interval_sec": config.poll_interval_sec,
@@ -95,13 +102,56 @@ def run_stream(
                 return
 
             ticks += 1
-            if ticks == 1 or ticks % config.refresh_titles_every == 0:
-                client.load_sheet_titles()
+            try:
+                if ticks == 1 or ticks % config.refresh_titles_every == 0:
+                    client.load_sheet_titles()
+                sheet_values = client.fetch_all_sheets()
+                consecutive_fetch_errors = 0
+            except Exception as exc:
+                if not _is_retryable_fetch_error(exc):
+                    raise
+                consecutive_fetch_errors += 1
+                retry_in = _next_retry_delay(
+                    attempt=consecutive_fetch_errors,
+                    base_sec=config.retry_base_sec,
+                    cap_sec=config.retry_cap_sec,
+                )
+                _emit(
+                    sink,
+                    "stream_warning",
+                    {
+                        "schema_version": 3,
+                        "warning_type": "source_retry",
+                        "warning": str(exc),
+                        "error_type": type(exc).__name__,
+                        "attempt": consecutive_fetch_errors,
+                        "next_retry_sec": retry_in,
+                        "at": datetime.now().isoformat(),
+                    },
+                )
+                if consecutive_fetch_errors >= config.retry_max_attempts:
+                    raise RuntimeError(
+                        f"Превышено число попыток чтения источника ({config.retry_max_attempts}): {exc}"
+                    ) from exc
+                if _sleep_with_stop(stop_event=stop_event, seconds=retry_in):
+                    _emit(
+                        sink,
+                        "stream_stopped",
+                        {
+                            "schema_version": 3,
+                            "stopped_at": datetime.now().isoformat(),
+                            "reason": "external_stop",
+                        },
+                    )
+                    return
+                continue
 
-            sheet_values = client.fetch_all_sheets()
             parsed = parse_protocol_sheets(sheet_values)
             now_ts = datetime.now()
             current_snapshot = {athlete.athlete_key: athlete for athlete in parsed.athletes}
+            has_any_progress = any(athlete.has_any_progress() for athlete in parsed.athletes)
+            competition_phase = "running" if has_any_progress else "upcoming"
+            status_text = "Соревнование идет" if has_any_progress else "Соревнование скоро начнется"
 
             changes = diff_athletes(previous_snapshot, current_snapshot)
             store.persist_changes(changes)
@@ -114,6 +164,22 @@ def run_stream(
 
             effective_groups = tracker.apply_auto_finalize(parsed.groups, now_ts)
             sheet_progress = build_sheet_progress(effective_groups)
+            if not snapshot_emitted:
+                _emit(
+                    sink,
+                    "stream_snapshot",
+                    {
+                        "schema_version": 3,
+                        "ts": now_ts.isoformat(),
+                        "competition_phase": competition_phase,
+                        "status_text": status_text,
+                        "competition_title": _extract_competition_title(parsed.athletes),
+                        "teams": _extract_teams(parsed.athletes),
+                        "athletes": _serialize_athletes(list(parsed.athletes)),
+                        "groups": _serialize_groups_snapshot(effective_groups),
+                    },
+                )
+                snapshot_emitted = True
 
             if changes:
                 _out(config, render_tick_header(len(changes)))
@@ -121,8 +187,10 @@ def run_stream(
                     sink,
                     "tick",
                     {
-                        "schema_version": 2,
+                        "schema_version": 3,
                         "ts": now_ts.isoformat(),
+                        "competition_phase": competition_phase,
+                        "status_text": status_text,
                         "changed_count": len(changes),
                         "updated_results": _serialize_athletes(updated_results),
                         "data": {
@@ -141,7 +209,7 @@ def run_stream(
                         sink,
                         "result_updated",
                         {
-                            "schema_version": 2,
+                            "schema_version": 3,
                             "lines": change_lines,
                             "lines_plain": _to_plain_lines(change_lines),
                             "count": len(change_lines),
@@ -175,7 +243,7 @@ def run_stream(
                             sink,
                             "kanaev_summary_updated",
                             {
-                                "schema_version": 2,
+                                "schema_version": 3,
                                 "sheet_name": group.sheet_name,
                                 "lines": summary_lines,
                                 "lines_plain": _to_plain_lines(summary_lines),
@@ -198,7 +266,7 @@ def run_stream(
                         sink,
                         "group_table_updated",
                         {
-                            "schema_version": 2,
+                            "schema_version": 3,
                             "group_key": group.group_key,
                             "sheet_name": group.sheet_name,
                             "group_name": group.group_name,
@@ -231,7 +299,7 @@ def run_stream(
                     sink,
                     "group_completed",
                     {
-                        "schema_version": 2,
+                        "schema_version": 3,
                         "group_key": group.group_key,
                         "sheet_name": group.sheet_name,
                         "group_name": group.group_name,
@@ -264,7 +332,7 @@ def run_stream(
                     sink,
                     "overall_completed",
                     {
-                        "schema_version": 2,
+                        "schema_version": 3,
                         "lines": overall_lines,
                         "lines_plain": _to_plain_lines(overall_lines),
                         "completed_at": datetime.now().isoformat(),
@@ -279,20 +347,53 @@ def run_stream(
                         sink,
                         "stream_completed",
                         {
-                            "schema_version": 2,
+                            "schema_version": 3,
                             "completed_at": datetime.now().isoformat(),
                         },
                     )
                     return
 
+            forecast_payload = _build_start_forecast_payload(
+                groups=effective_groups,
+                sheet_progress=sheet_progress,
+                tracker=tracker,
+                now=now_ts,
+            )
+            forecast_hash = hashlib.sha256(
+                json.dumps(forecast_payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
+            ).hexdigest()
+            if forecast_hash != last_forecast_hash:
+                _emit(
+                    sink,
+                    "start_forecast_updated",
+                    {
+                        "schema_version": 3,
+                        "ts": now_ts.isoformat(),
+                        "competition_phase": competition_phase,
+                        "status_text": status_text,
+                        **forecast_payload,
+                    },
+                )
+                last_forecast_hash = forecast_hash
+
             previous_snapshot = current_snapshot
-            time.sleep(config.poll_interval_sec)
+            if _sleep_with_stop(stop_event=stop_event, seconds=config.poll_interval_sec):
+                _emit(
+                    sink,
+                    "stream_stopped",
+                    {
+                        "schema_version": 3,
+                        "stopped_at": datetime.now().isoformat(),
+                        "reason": "external_stop",
+                    },
+                )
+                return
     except Exception as exc:
         _emit(
             sink,
             "stream_error",
             {
-                "schema_version": 2,
+                "schema_version": 3,
                 "error": str(exc),
                 "error_type": type(exc).__name__,
                 "failed_at": datetime.now().isoformat(),
@@ -301,6 +402,124 @@ def run_stream(
         raise
     finally:
         store.close()
+
+
+def _is_retryable_fetch_error(exc: Exception) -> bool:
+    text = str(exc).lower()
+    markers = ("429", "rate_limit_exceeded", "quota exceeded", "timed out", "temporarily unavailable", "503", "502")
+    return any(marker in text for marker in markers)
+
+
+def _next_retry_delay(attempt: int, base_sec: float, cap_sec: float) -> float:
+    if attempt <= 1:
+        return max(base_sec, 1.0)
+    scaled = base_sec + ((attempt - 1) * 5.0)
+    return min(max(scaled, 1.0), max(cap_sec, 1.0))
+
+
+def _sleep_with_stop(stop_event: threading.Event | None, seconds: float) -> bool:
+    if seconds <= 0:
+        return bool(stop_event and stop_event.is_set())
+    if stop_event is None:
+        time.sleep(seconds)
+        return False
+    return stop_event.wait(timeout=seconds)
+
+
+def _extract_teams(athletes: tuple[AthleteRow, ...]) -> list[str]:
+    teams = sorted({athlete.club.strip() for athlete in athletes if athlete.club.strip()}, key=str.lower)
+    return teams
+
+
+def _extract_competition_title(athletes: tuple[AthleteRow, ...]) -> str:
+    for athlete in athletes:
+        title = athlete.event_name.strip()
+        if title:
+            return title
+    return ""
+
+
+def _serialize_groups_snapshot(groups: tuple[GroupBlock, ...]) -> list[dict[str, object]]:
+    payload: list[dict[str, object]] = []
+    for group in groups:
+        analytics = build_group_analytics(group=group, sheet_phase=group_phase(group))
+        table_lines = render_group_table(group, header="Снимок группы", analytics=analytics)
+        completion_stage = _infer_completed_stage(group)
+        payload.append(
+            {
+                "group_key": group.group_key,
+                "sheet_name": group.sheet_name,
+                "group_name": group.group_name,
+                "run_stage": completion_stage,
+                "is_finalized": completion_stage is not None,
+                "data": _serialize_group_table(
+                    group=group,
+                    analytics=analytics,
+                    rendered_lines=table_lines,
+                    header="Снимок группы",
+                ),
+            }
+        )
+    return payload
+
+
+def _infer_completed_stage(group: GroupBlock) -> int | None:
+    run1_complete = all(not athlete.run1.is_empty for athlete in group.athletes) if group.athletes else False
+    run2_complete = all(not athlete.run2.is_empty for athlete in group.athletes) if group.athletes else False
+    if run2_complete:
+        return 2
+    if run1_complete:
+        return 1
+    return None
+
+
+def _build_start_forecast_payload(
+    *,
+    groups: tuple[GroupBlock, ...],
+    sheet_progress: dict[str, object],
+    tracker: LiveGroupTracker,
+    now: datetime,
+) -> dict[str, object]:
+    rows: list[dict[str, object]] = []
+    for group in groups:
+        progress = sheet_progress.get(group.sheet_name)
+        current_run = int(getattr(progress, "current_run", 0) or 0)
+        if current_run not in {1, 2}:
+            continue
+        for athlete in group.athletes:
+            if current_run == 1:
+                has_result = not athlete.run1.is_empty
+            else:
+                has_result = not athlete.run2.is_empty
+            eta = tracker.estimate_result_time(
+                sheet_athletes=tuple(getattr(progress, "athletes", tuple(group.athletes))),
+                sheet_name=group.sheet_name,
+                run_number=current_run,
+                athlete_key=athlete.athlete_key,
+                now=now,
+            )
+            rows.append(
+                {
+                    "athlete_key": athlete.athlete_key,
+                    "sheet_name": group.sheet_name,
+                    "group_name": group.group_name,
+                    "run_number": current_run,
+                    "start_number": athlete.start_number,
+                    "full_name": athlete.full_name,
+                    "club": athlete.club,
+                    "has_result": has_result,
+                    "eta": (eta.isoformat() if eta else ""),
+                }
+            )
+    rows.sort(
+        key=lambda item: (
+            str(item.get("sheet_name") or "").lower(),
+            int(item.get("run_number") or 0),
+            str(item.get("group_name") or "").lower(),
+            int(item.get("start_number") or 0),
+        )
+    )
+    return {"rows": rows}
 
 
 def _serialize_athletes(athletes: list[AthleteRow]) -> list[dict[str, object]]:
