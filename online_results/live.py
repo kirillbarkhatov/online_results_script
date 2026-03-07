@@ -95,13 +95,26 @@ class LiveGroupTracker:
                 result.append(group)
                 continue
 
-            missing = [athlete for athlete in group.athletes if not athlete.is_finished()]
+            phase = group_phase(group)
+            if phase == "run1":
+                run_number = 1
+                missing = [athlete for athlete in group.athletes if athlete.run1.is_empty]
+            elif phase == "run2":
+                run_number = 2
+                missing = [
+                    athlete
+                    for athlete in group.athletes
+                    if (not athlete.run1.is_empty) and _is_eligible_for_run2(athlete) and athlete.run2.is_empty
+                ]
+            else:
+                result.append(group)
+                continue
+
             if not missing:
                 result.append(group)
                 continue
 
             missing_count = len(missing)
-            run_number = 2 if started_run2_by_index[idx] else 1
             by_next_started = self._has_next_started_group(
                 indexed=indexed,
                 current_index=idx,
@@ -116,8 +129,8 @@ class LiveGroupTracker:
                     by_timeout = (now - last_touch) >= self._finalize_timeout
 
             if by_next_started or by_timeout:
-                self._auto_finalized_groups.add(group.group_key)
-                result.append(_finalize_group_with_dns(group))
+                self._auto_finalized_groups.add(f"{group.group_key}|run{run_number}")
+                result.append(_finalize_group_with_dns(group, run_number=run_number))
                 continue
 
             result.append(group)
@@ -302,18 +315,24 @@ def group_phase(group: GroupBlock) -> SheetPhase:
     return "not_started"
 
 
-def _finalize_group_with_dns(group: GroupBlock) -> GroupBlock:
+def _finalize_group_with_dns(group: GroupBlock, run_number: int) -> GroupBlock:
     finalized: list[AthleteRow] = []
     for athlete in group.athletes:
-        if athlete.is_finished():
+        should_finalize = False
+        if run_number == 1:
+            should_finalize = athlete.run1.is_empty
+        elif run_number == 2:
+            should_finalize = (not athlete.run1.is_empty) and _is_eligible_for_run2(athlete) and athlete.run2.is_empty
+
+        if not should_finalize:
             finalized.append(athlete)
             continue
 
         run1 = athlete.run1
         run2 = athlete.run2
-        if run1.is_empty:
+        if run_number == 1 and run1.is_empty:
             run1 = AUTO_DNS_VALUE
-        elif run2.is_empty:
+        elif run_number == 2 and run2.is_empty:
             run2 = AUTO_DNS_VALUE
 
         auto_note = "автофинализация: DNS"
