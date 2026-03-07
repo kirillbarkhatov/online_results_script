@@ -14,7 +14,7 @@ services:
       SQLITE_DB_PATH: /data/online_results.db
     volumes:
       - ./data:/data
-      - ${GOOGLE_SERVICE_ACCOUNT_FILE_HOST:-./pythonaccess-360812-8c6cba224115.json}:/run/secrets/google-service-account.json:ro
+      - ${GOOGLE_SERVICE_ACCOUNT_FILE}:/run/secrets/google-service-account.json:ro
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3)"]
       interval: 30s
