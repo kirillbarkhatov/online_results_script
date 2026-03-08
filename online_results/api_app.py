@@ -122,6 +122,10 @@ class StreamManager:
         if not settings.service_account_file:
             raise RuntimeError("Не задан GOOGLE_SERVICE_ACCOUNT_FILE")
         spreadsheet_id = _extract_google_file_id(req.protocol_link)
+        with self._lock:
+            for runtime in self._streams.values():
+                if runtime.spreadsheet_id == spreadsheet_id and runtime.status == "running":
+                    return runtime
         stream_id = uuid.uuid4().hex
         runtime = StreamRuntime(
             stream_id=stream_id,

@@ -806,7 +806,8 @@ def rank_group(athletes: tuple[AthleteRow, ...]) -> list[tuple[int, AthleteRow, 
         second_run_done = [athlete for athlete in athletes if athlete.has_second_run_result()]
         second_run_waiting = [athlete for athlete in athletes if not athlete.has_second_run_result()]
         ranked = sorted(second_run_done, key=lambda athlete: (athlete.ranking_value().sort_key(), athlete.start_number))
-        ranked.extend(sorted(second_run_waiting, key=lambda athlete: (athlete.run1.sort_key(), athlete.start_number)))
+        # During run2, keep waiting athletes in the same order as in the source Google sheet.
+        ranked.extend(sorted(second_run_waiting, key=lambda athlete: (athlete.sheet_row, athlete.start_number)))
     else:
         ranked = sorted(athletes, key=lambda athlete: (athlete.ranking_value().sort_key(), athlete.start_number))
     leader_value = _leader_time(ranked)
