@@ -40,6 +40,7 @@ class SQLiteStore:
                 start_number INTEGER NOT NULL,
                 full_name TEXT NOT NULL,
                 club TEXT NOT NULL,
+                runs_count INTEGER NOT NULL DEFAULT 2,
                 event_name TEXT NOT NULL DEFAULT '',
                 event_date TEXT NOT NULL DEFAULT '',
                 created_at TEXT NOT NULL,
@@ -76,6 +77,7 @@ class SQLiteStore:
         )
         self._ensure_column("athletes", "event_name", "TEXT NOT NULL DEFAULT ''")
         self._ensure_column("athletes", "event_date", "TEXT NOT NULL DEFAULT ''")
+        self._ensure_column("athletes", "runs_count", "INTEGER NOT NULL DEFAULT 2")
         self._connection.commit()
 
     def _ensure_column(self, table_name: str, column_name: str, definition: str) -> None:
@@ -103,8 +105,8 @@ class SQLiteStore:
             cursor.execute(
                 """
                 INSERT INTO athletes(
-                    athlete_key, sheet_name, group_name, sheet_row, start_number, full_name, club, event_name, event_date, created_at, updated_at
-                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    athlete_key, sheet_name, group_name, sheet_row, start_number, full_name, club, runs_count, event_name, event_date, created_at, updated_at
+                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(athlete_key) DO UPDATE SET
                     sheet_name=excluded.sheet_name,
                     group_name=excluded.group_name,
@@ -112,6 +114,7 @@ class SQLiteStore:
                     start_number=excluded.start_number,
                     full_name=excluded.full_name,
                     club=excluded.club,
+                    runs_count=excluded.runs_count,
                     event_name=excluded.event_name,
                     event_date=excluded.event_date,
                     updated_at=excluded.updated_at
@@ -124,6 +127,7 @@ class SQLiteStore:
                     athlete.start_number,
                     athlete.full_name,
                     athlete.club,
+                    athlete.runs_count,
                     athlete.event_name,
                     athlete.event_date,
                     now,
@@ -199,6 +203,7 @@ class SQLiteStore:
                 a.start_number,
                 a.full_name,
                 a.club,
+                COALESCE(a.runs_count, 2) AS runs_count,
                 COALESCE(a.event_name, '') AS event_name,
                 COALESCE(a.event_date, '') AS event_date,
                 COALESCE(c.run1_raw, '') AS run1_raw,
@@ -221,6 +226,7 @@ class SQLiteStore:
                 start_number=int(row["start_number"]),
                 full_name=str(row["full_name"]),
                 club=str(row["club"]),
+                runs_count=int(row["runs_count"] or 2),
                 run1=parse_value(str(row["run1_raw"])),
                 run2=parse_value(str(row["run2_raw"])),
                 total=parse_value(str(row["total_raw"])),
@@ -351,6 +357,7 @@ def _athlete_payload(athlete: AthleteRow | None) -> dict[str, str] | None:
         "start_number": str(athlete.start_number),
         "full_name": athlete.full_name,
         "club": athlete.club,
+        "runs_count": str(athlete.runs_count),
         "event_name": athlete.event_name,
         "event_date": athlete.event_date,
         "judge_note": athlete.judge_note,

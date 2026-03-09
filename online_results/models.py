@@ -58,6 +58,7 @@ class AthleteRow:
     run1: ParsedValue
     run2: ParsedValue
     total: ParsedValue
+    runs_count: int = 2
     event_name: str = ""
     event_date: str = ""
     judge_note: str = ""
@@ -66,6 +67,8 @@ class AthleteRow:
         return any(not value.is_empty for value in (self.run1, self.run2, self.total))
 
     def has_second_run_result(self) -> bool:
+        if self.runs_count <= 1:
+            return False
         return not self.run2.is_empty
 
     def effective_total(self) -> ParsedValue:
@@ -84,8 +87,13 @@ class AthleteRow:
         return EMPTY_VALUE
 
     def is_finished(self) -> bool:
-        # Group completion is allowed by run2 value OR final status.
-        return self.has_second_run_result() or self.effective_total().is_status
+        # Group completion is allowed by final status in any format.
+        if self.effective_total().is_status:
+            return True
+        if self.runs_count <= 1:
+            # Single-run format: result in run1 or explicit total time means finished.
+            return (not self.run1.is_empty) or self.total.is_time
+        return self.has_second_run_result()
 
     def last_passed_track(self) -> ParsedValue:
         if not self.run2.is_empty:

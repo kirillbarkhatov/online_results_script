@@ -149,11 +149,12 @@ def _parse_sheet_format_a(sheet_name: str, rows: list[list[str]]) -> list[Athlet
         full_name = _clean(_cell(row, cmap.full_name)) if cmap.full_name is not None else ""
         club = _clean(_cell(row, cmap.club))
         run1 = parse_value(_clean(_cell(row, cmap.run1)))
+        runs_count = 2
         if cmap.run2 is not None:
             run2 = parse_value(_clean(_cell(row, cmap.run2)))
         else:
-            # Single-run protocols should still be considered complete for group stats.
-            run2 = run1
+            run2 = ParsedValue(raw="", value_type="empty")
+            runs_count = 1
         total = parse_value(_clean(_cell(row, cmap.total))) if cmap.total is not None else ParsedValue(raw="", value_type="empty")
         judge_note = _extract_judge_note(row, (cmap.total if cmap.total is not None else cmap.run1) + 1)
 
@@ -170,6 +171,7 @@ def _parse_sheet_format_a(sheet_name: str, rows: list[list[str]]) -> list[Athlet
                 run1=run1,
                 run2=run2,
                 total=total,
+                runs_count=runs_count,
                 event_name=sheet_meta.event_name,
                 event_date=sheet_meta.event_date,
                 judge_note=judge_note,
@@ -229,6 +231,7 @@ def _parse_sheet_format_b(sheet_name: str, rows: list[list[str]]) -> list[Athlet
                 run1=run1,
                 run2=run2,
                 total=total,
+                runs_count=2,
                 event_name=sheet_meta.event_name,
                 event_date=sheet_meta.event_date,
                 judge_note=judge_note,
@@ -373,6 +376,7 @@ def _parse_sheet_legacy(sheet_name: str, rows: list[list[str]]) -> list[AthleteR
                 run1=run1,
                 run2=run2,
                 total=total,
+                runs_count=2,
                 event_name=sheet_meta.event_name,
                 event_date=sheet_meta.event_date,
                 judge_note=judge_note,

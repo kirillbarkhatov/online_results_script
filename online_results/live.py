@@ -128,7 +128,8 @@ class LiveGroupTracker:
                 if last_touch is not None:
                     by_timeout = (now - last_touch) >= self._finalize_timeout
 
-            if by_next_started or by_timeout:
+            can_finalize_by_progress = missing_count <= self._finalize_max_missing
+            if (by_next_started and can_finalize_by_progress) or by_timeout:
                 self._auto_finalized_groups.add(f"{group.group_key}|run{run_number}")
                 result.append(_finalize_group_with_dns(group, run_number=run_number))
                 continue
@@ -349,6 +350,9 @@ def _finalize_group_with_dns(group: GroupBlock, run_number: int) -> GroupBlock:
                 run1=run1,
                 run2=run2,
                 total=athlete.total,
+                runs_count=athlete.runs_count,
+                event_name=athlete.event_name,
+                event_date=athlete.event_date,
                 judge_note=judge_note,
             )
         )
@@ -507,6 +511,8 @@ def render_group_table(group: GroupBlock, header: str, analytics: GroupAnalytics
 
 
 def build_group_analytics(group: GroupBlock, sheet_phase: SheetPhase) -> GroupAnalytics | None:
+    if _is_single_run_group(group):
+        return None
     if sheet_phase == "break_after_run1":
         return _build_run1_gap_analytics(group)
     if sheet_phase == "completed":
@@ -1275,7 +1281,11 @@ def _preferred_club_label(current: str | None, candidate: str) -> str:
 
 def _is_eligible_for_run2(athlete: AthleteRow) -> bool:
     # Athletes with terminal status in run1 are treated as non-starters for run2 forecast queue.
-    return not athlete.run1.is_status
+    return athlete.runs_count > 1 and (not athlete.run1.is_status)
+
+
+def _is_single_run_group(group: GroupBlock) -> bool:
+    return bool(group.athletes) and all(athlete.runs_count <= 1 for athlete in group.athletes)
 
 
 def _place_word(value: int) -> str:

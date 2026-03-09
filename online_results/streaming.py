@@ -150,6 +150,7 @@ def run_stream(
             now_ts = datetime.now()
             current_snapshot = {athlete.athlete_key: athlete for athlete in parsed.athletes}
             has_any_progress = any(athlete.has_any_progress() for athlete in parsed.athletes)
+            competition_format = _detect_competition_format(parsed.athletes)
             competition_phase = "running" if has_any_progress else "upcoming"
             status_text = "Соревнование идет" if has_any_progress else "Соревнование скоро начнется"
 
@@ -172,6 +173,7 @@ def run_stream(
                         "schema_version": 3,
                         "ts": now_ts.isoformat(),
                         "competition_phase": competition_phase,
+                        "competition_format": competition_format,
                         "status_text": status_text,
                         "competition_title": _extract_competition_title(parsed.athletes),
                         "teams": _extract_teams(parsed.athletes),
@@ -183,6 +185,7 @@ def run_stream(
 
             if changes:
                 _out(config, render_tick_header(len(changes)))
+                group_order_by_key = {group.group_key: index for index, group in enumerate(effective_groups)}
                 _emit(
                     sink,
                     "tick",
@@ -190,6 +193,7 @@ def run_stream(
                         "schema_version": 3,
                         "ts": now_ts.isoformat(),
                         "competition_phase": competition_phase,
+                        "competition_format": competition_format,
                         "status_text": status_text,
                         "changed_count": len(changes),
                         "updated_results": _serialize_athletes(updated_results),
@@ -277,7 +281,9 @@ def run_stream(
                                 analytics=analytics,
                                 rendered_lines=lines,
                                 header="Обновленная группа",
+                                order_index=group_order_by_key.get(group.group_key, 0),
                             ),
+                            "order_index": group_order_by_key.get(group.group_key, 0),
                         },
                     )
 
@@ -285,6 +291,10 @@ def run_stream(
             if completed_groups and not changes:
                 _out(config, render_tick_header(0))
             for group in completed_groups:
+                group_order_index = next(
+                    (index for index, candidate in enumerate(effective_groups) if candidate.group_key == group.group_key),
+                    0,
+                )
                 analytics = build_group_analytics(
                     group=group,
                     sheet_phase=group_phase(group),
@@ -313,11 +323,13 @@ def run_stream(
                                 analytics=analytics,
                                 rendered_lines=group_lines,
                                 header="Группа завершила старт",
+                                order_index=group_order_index,
                             ),
                             "club_stats": {
                                 "lines_plain": _to_plain_lines(club_lines),
                             },
                         },
+                        "order_index": group_order_index,
                     },
                 )
 
@@ -370,6 +382,7 @@ def run_stream(
                         "schema_version": 3,
                         "ts": now_ts.isoformat(),
                         "competition_phase": competition_phase,
+                        "competition_format": competition_format,
                         "status_text": status_text,
                         **forecast_payload,
                     },
@@ -441,7 +454,7 @@ def _extract_competition_title(athletes: tuple[AthleteRow, ...]) -> str:
 
 def _serialize_groups_snapshot(groups: tuple[GroupBlock, ...]) -> list[dict[str, object]]:
     payload: list[dict[str, object]] = []
-    for group in groups:
+    for order_index, group in enumerate(groups):
         analytics = build_group_analytics(group=group, sheet_phase=group_phase(group))
         table_lines = render_group_table(group, header="Снимок группы", analytics=analytics)
         completion_stage = _infer_completed_stage(group)
@@ -452,11 +465,13 @@ def _serialize_groups_snapshot(groups: tuple[GroupBlock, ...]) -> list[dict[str,
                 "group_name": group.group_name,
                 "run_stage": completion_stage,
                 "is_finalized": completion_stage is not None,
+                "order_index": order_index,
                 "data": _serialize_group_table(
                     group=group,
                     analytics=analytics,
                     rendered_lines=table_lines,
                     header="Снимок группы",
+                    order_index=order_index,
                 ),
             }
         )
@@ -481,6 +496,7 @@ def _build_start_forecast_payload(
     now: datetime,
 ) -> dict[str, object]:
     rows: list[dict[str, object]] = []
+    group_order_by_key = {group.group_key: index for index, group in enumerate(groups)}
     for group in groups:
         progress = sheet_progress.get(group.sheet_name)
         current_run = int(getattr(progress, "current_run", 0) or 0)
@@ -509,11 +525,13 @@ def _build_start_forecast_payload(
                     "club": athlete.club,
                     "has_result": has_result,
                     "eta": (eta.isoformat() if eta else ""),
+                    "order_index": group_order_by_key.get(group.group_key, 0),
                 }
             )
     rows.sort(
         key=lambda item: (
             str(item.get("sheet_name") or "").lower(),
+            int(item.get("order_index") or 0),
             int(item.get("run_number") or 0),
             str(item.get("group_name") or "").lower(),
             int(item.get("start_number") or 0),
@@ -536,6 +554,7 @@ def _serialize_athletes(athletes: list[AthleteRow]) -> list[dict[str, object]]:
                 "run1": athlete.run1.to_display() or "-",
                 "run2": athlete.run2.to_display() or "-",
                 "total": athlete.effective_total().to_display() or "-",
+                "runs_count": athlete.runs_count,
                 "judge_note": athlete.judge_note,
             }
         )
@@ -578,6 +597,7 @@ def _serialize_group_table(
     analytics,
     rendered_lines: list[str],
     header: str,
+    order_index: int = 0,
 ) -> dict[str, object]:
     ranking = rank_group(group.athletes)
     extra_headers = analytics.headers if analytics else tuple()
@@ -593,6 +613,7 @@ def _serialize_group_table(
             "run1": athlete.run1.to_display() or "-",
             "run2": athlete.run2.to_display() or "-",
             "total": athlete.effective_total().to_display() or "-",
+            "runs_count": athlete.runs_count,
             "interval": (f"+{interval:.2f}" if interval is not None else "-"),
             "judge_note": athlete.judge_note,
         }
@@ -608,7 +629,14 @@ def _serialize_group_table(
         "group_key": group.group_key,
         "sheet_name": group.sheet_name,
         "group_name": group.group_name,
+        "order_index": order_index,
         "headers": list(headers),
         "rows": rows,
         "lines_plain": _to_plain_lines(rendered_lines),
     }
+
+
+def _detect_competition_format(athletes: tuple[AthleteRow, ...]) -> str:
+    if athletes and all(athlete.runs_count <= 1 for athlete in athletes):
+        return "single_run"
+    return "two_run"

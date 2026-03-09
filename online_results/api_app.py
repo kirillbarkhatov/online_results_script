@@ -62,6 +62,11 @@ class StartStreamResponse(BaseModel):
     status: str
 
 
+class ResetStreamStateResponse(BaseModel):
+    stream_id: str
+    status: str
+
+
 class EventItemResponse(BaseModel):
     event_date: str
     event_name: str
@@ -183,6 +188,28 @@ class StreamManager:
                 runtime.status = "stopped"
                 runtime.finished_at = datetime.now().isoformat()
             return runtime
+
+    def reset_state(self, stream_id: str) -> StreamRuntime:
+        with self._lock:
+            runtime = self._streams.get(stream_id)
+            if runtime is None:
+                raise KeyError(stream_id)
+            runtime.stop_event.set()
+            if runtime.status == "running":
+                runtime.status = "stopped"
+                runtime.finished_at = datetime.now().isoformat()
+            thread = runtime.thread
+
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=10.0)
+            if thread.is_alive():
+                raise RuntimeError("stream thread did not stop in time")
+
+        settings = load_settings(require_source=False)
+        _clear_sqlite_state(settings.sqlite_db)
+        with self._lock:
+            self._subscribers.pop(stream_id, None)
+        return runtime
 
     def get(self, stream_id: str) -> StreamRuntime:
         with self._lock:
@@ -326,6 +353,19 @@ def stop_stream(stream_id: str) -> StreamStateResponse:
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="stream not found") from exc
     return _to_response(runtime)
+
+
+@app.post("/v1/streams/{stream_id}/reset-state", response_model=ResetStreamStateResponse)
+def reset_stream_state(stream_id: str) -> ResetStreamStateResponse:
+    try:
+        runtime = manager.reset_state(stream_id)
+    except KeyError:
+        settings = load_settings(require_source=False)
+        _clear_sqlite_state(settings.sqlite_db)
+        return ResetStreamStateResponse(stream_id=stream_id, status="reset")
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return ResetStreamStateResponse(stream_id=runtime.stream_id, status="reset")
 
 
 @app.get("/v1/results/events", response_model=list[EventItemResponse])
@@ -510,3 +550,13 @@ def _merge_result_cell(existing: str | None, incoming: str) -> str:
     if incoming_num and not existing_num:
         return existing
     return incoming if priority.get(incoming, 0) >= priority.get(existing, 0) else existing
+
+
+def _clear_sqlite_state(sqlite_db: str) -> None:
+    targets = [sqlite_db, f"{sqlite_db}-wal", f"{sqlite_db}-shm"]
+    for path in targets:
+        try:
+            if path and os.path.exists(path):
+                os.remove(path)
+        except OSError as exc:
+            logger.warning("sqlite_state_clear_failed path=%s error=%s", path, exc)
