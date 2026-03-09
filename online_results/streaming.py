@@ -13,6 +13,7 @@ from .db import SQLiteStore, diff_athletes
 from .live import (
     LiveGroupTracker,
     build_group_analytics,
+    build_run1_analytics,
     build_sheet_progress,
     group_phase,
     has_result_update,
@@ -165,6 +166,8 @@ def run_stream(
 
             effective_groups = tracker.apply_auto_finalize(parsed.groups, now_ts)
             sheet_progress = build_sheet_progress(effective_groups)
+            current_group = tracker.find_current_group(effective_groups)
+            current_group_key = current_group.group_key if current_group else ""
             if not snapshot_emitted:
                 _emit(
                     sink,
@@ -175,6 +178,7 @@ def run_stream(
                         "competition_phase": competition_phase,
                         "competition_format": competition_format,
                         "status_text": status_text,
+                        "current_group_key": current_group_key,
                         "competition_title": _extract_competition_title(parsed.athletes),
                         "teams": _extract_teams(parsed.athletes),
                         "athletes": _serialize_athletes(list(parsed.athletes)),
@@ -195,6 +199,7 @@ def run_stream(
                         "competition_phase": competition_phase,
                         "competition_format": competition_format,
                         "status_text": status_text,
+                        "current_group_key": current_group_key,
                         "changed_count": len(changes),
                         "updated_results": _serialize_athletes(updated_results),
                         "data": {
@@ -263,6 +268,7 @@ def run_stream(
                         group=group,
                         sheet_phase=group_phase(group),
                     )
+                    run1_analytics = build_run1_analytics(group=group)
                     lines = render_group_table(group, header="Обновленная группа", analytics=analytics)
                     for line in lines:
                         _out(config, line)
@@ -279,6 +285,7 @@ def run_stream(
                             "data": _serialize_group_table(
                                 group=group,
                                 analytics=analytics,
+                                run1_analytics=run1_analytics,
                                 rendered_lines=lines,
                                 header="Обновленная группа",
                                 order_index=group_order_by_key.get(group.group_key, 0),
@@ -299,6 +306,7 @@ def run_stream(
                     group=group,
                     sheet_phase=group_phase(group),
                 )
+                run1_analytics = build_run1_analytics(group=group)
                 group_lines = render_group_table(group, header="Группа завершила старт", analytics=analytics)
                 for line in group_lines:
                     _out(config, line)
@@ -321,6 +329,7 @@ def run_stream(
                             "group_table": _serialize_group_table(
                                 group=group,
                                 analytics=analytics,
+                                run1_analytics=run1_analytics,
                                 rendered_lines=group_lines,
                                 header="Группа завершила старт",
                                 order_index=group_order_index,
@@ -384,6 +393,7 @@ def run_stream(
                         "competition_phase": competition_phase,
                         "competition_format": competition_format,
                         "status_text": status_text,
+                        "current_group_key": current_group_key,
                         **forecast_payload,
                     },
                 )
@@ -456,6 +466,7 @@ def _serialize_groups_snapshot(groups: tuple[GroupBlock, ...]) -> list[dict[str,
     payload: list[dict[str, object]] = []
     for order_index, group in enumerate(groups):
         analytics = build_group_analytics(group=group, sheet_phase=group_phase(group))
+        run1_analytics = build_run1_analytics(group=group)
         table_lines = render_group_table(group, header="Снимок группы", analytics=analytics)
         completion_stage = _infer_completed_stage(group)
         payload.append(
@@ -469,6 +480,7 @@ def _serialize_groups_snapshot(groups: tuple[GroupBlock, ...]) -> list[dict[str,
                 "data": _serialize_group_table(
                     group=group,
                     analytics=analytics,
+                    run1_analytics=run1_analytics,
                     rendered_lines=table_lines,
                     header="Снимок группы",
                     order_index=order_index,
@@ -595,6 +607,7 @@ def _to_plain_lines(lines: list[str]) -> list[str]:
 def _serialize_group_table(
     group: GroupBlock,
     analytics,
+    run1_analytics,
     rendered_lines: list[str],
     header: str,
     order_index: int = 0,
@@ -632,7 +645,30 @@ def _serialize_group_table(
         "order_index": order_index,
         "headers": list(headers),
         "rows": rows,
+        "run1_analytics": _serialize_analytics_block(run1_analytics),
         "lines_plain": _to_plain_lines(rendered_lines),
+    }
+
+
+def _serialize_analytics_block(analytics) -> dict[str, object]:
+    if not analytics:
+        return {}
+    headers = list(getattr(analytics, "headers", tuple()) or tuple())
+    values_by_athlete = getattr(analytics, "values_by_athlete", {})
+    if not headers or not isinstance(values_by_athlete, dict):
+        return {}
+    serialized_values: dict[str, dict[str, str]] = {}
+    for athlete_key, values in values_by_athlete.items():
+        if not isinstance(athlete_key, str):
+            continue
+        tuple_values = values if isinstance(values, tuple) else tuple(values) if isinstance(values, list) else tuple()
+        serialized_values[athlete_key] = {
+            str(name): str(value)
+            for name, value in zip(headers, tuple_values, strict=False)
+        }
+    return {
+        "headers": headers,
+        "values_by_athlete": serialized_values,
     }
 
 

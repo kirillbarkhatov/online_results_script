@@ -520,6 +520,12 @@ def build_group_analytics(group: GroupBlock, sheet_phase: SheetPhase) -> GroupAn
     return None
 
 
+def build_run1_analytics(group: GroupBlock) -> GroupAnalytics | None:
+    if _is_single_run_group(group):
+        return None
+    return _build_run1_gap_analytics(group)
+
+
 def _build_run1_gap_analytics(group: GroupBlock) -> GroupAnalytics | None:
     if not all(not athlete.run1.is_empty for athlete in group.athletes):
         return None
@@ -807,15 +813,38 @@ def render_overall_club_stats(groups: tuple[GroupBlock, ...]) -> list[str]:
 
 
 def rank_group(athletes: tuple[AthleteRow, ...]) -> list[tuple[int, AthleteRow, float | None]]:
+    def _priority(athlete: AthleteRow) -> int:
+        value = athlete.ranking_value()
+        if _has_freeform_judge_note(athlete.judge_note):
+            return 1
+        if value.is_time:
+            return 0
+        if value.is_status and (value.status or "").upper() in {"DNS", "DNF", "DSQ"}:
+            return 2
+        return 3
+
+    def _sort_key(athlete: AthleteRow) -> tuple[int, float | str, int]:
+        value = athlete.ranking_value()
+        priority = _priority(athlete)
+        if priority == 0:
+            return (0, value.sort_key(), athlete.start_number)
+        if priority == 1:
+            note = (athlete.judge_note or "").strip().lower()
+            return (1, note, athlete.start_number)
+        if priority == 2:
+            status_order = {"DNS": 1.0, "DNF": 2.0, "DSQ": 3.0}
+            return (2, status_order.get((value.status or "").upper(), 9.0), athlete.start_number)
+        return (3, float(athlete.sheet_row), athlete.start_number)
+
     second_run_phase = any(athlete.has_second_run_result() for athlete in athletes)
     if second_run_phase:
         second_run_done = [athlete for athlete in athletes if athlete.has_second_run_result()]
         second_run_waiting = [athlete for athlete in athletes if not athlete.has_second_run_result()]
-        ranked = sorted(second_run_done, key=lambda athlete: (athlete.ranking_value().sort_key(), athlete.start_number))
+        ranked = sorted(second_run_done, key=_sort_key)
         # During run2, keep waiting athletes in the same order as in the source Google sheet.
         ranked.extend(sorted(second_run_waiting, key=lambda athlete: (athlete.sheet_row, athlete.start_number)))
     else:
-        ranked = sorted(athletes, key=lambda athlete: (athlete.ranking_value().sort_key(), athlete.start_number))
+        ranked = sorted(athletes, key=_sort_key)
     leader_value = _leader_time(ranked)
     result: list[tuple[int, AthleteRow, float | None]] = []
 
@@ -1246,6 +1275,11 @@ def _judge_note_text(athlete: AthleteRow) -> str:
     if not athlete.judge_note:
         return ""
     return f"; Пометка судьи: {athlete.judge_note}"
+
+
+def _has_freeform_judge_note(note: str) -> bool:
+    text = (note or "").strip().upper()
+    return bool(text) and text not in {"DNS", "DNF", "DSQ"}
 
 
 def _highlight_row(athlete: AthleteRow, text: str) -> str:
