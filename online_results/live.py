@@ -563,7 +563,10 @@ def _build_run1_gap_analytics(group: GroupBlock) -> GroupAnalytics | None:
 
 
 def _build_run2_analytics(group: GroupBlock) -> GroupAnalytics:
-    run1_ranked = sorted(group.athletes, key=lambda athlete: (athlete.run1.sort_key(), athlete.start_number))
+    run1_ranked = sorted(
+        group.athletes,
+        key=lambda athlete: _athlete_rank_sort_key(athlete, second_run_phase=False),
+    )
     run1_place = {athlete.athlete_key: index for index, athlete in enumerate(run1_ranked, start=1)}
 
     run2_ranked = rank_group(group.athletes)
@@ -813,38 +816,8 @@ def render_overall_club_stats(groups: tuple[GroupBlock, ...]) -> list[str]:
 
 
 def rank_group(athletes: tuple[AthleteRow, ...]) -> list[tuple[int, AthleteRow, float | None]]:
-    def _priority(athlete: AthleteRow) -> int:
-        value = athlete.ranking_value()
-        if _has_freeform_judge_note(athlete.judge_note):
-            return 1
-        if value.is_time:
-            return 0
-        if value.is_status and (value.status or "").upper() in {"DNS", "DNF", "DSQ"}:
-            return 2
-        return 3
-
-    def _sort_key(athlete: AthleteRow) -> tuple[int, float | str, int]:
-        value = athlete.ranking_value()
-        priority = _priority(athlete)
-        if priority == 0:
-            return (0, value.sort_key(), athlete.start_number)
-        if priority == 1:
-            note = (athlete.judge_note or "").strip().lower()
-            return (1, note, athlete.start_number)
-        if priority == 2:
-            status_order = {"DNS": 1.0, "DNF": 2.0, "DSQ": 3.0}
-            return (2, status_order.get((value.status or "").upper(), 9.0), athlete.start_number)
-        return (3, float(athlete.sheet_row), athlete.start_number)
-
     second_run_phase = any(athlete.has_second_run_result() for athlete in athletes)
-    if second_run_phase:
-        second_run_done = [athlete for athlete in athletes if athlete.has_second_run_result()]
-        second_run_waiting = [athlete for athlete in athletes if not athlete.has_second_run_result()]
-        ranked = sorted(second_run_done, key=_sort_key)
-        # During run2, keep waiting athletes in the same order as in the source Google sheet.
-        ranked.extend(sorted(second_run_waiting, key=lambda athlete: (athlete.sheet_row, athlete.start_number)))
-    else:
-        ranked = sorted(athletes, key=_sort_key)
+    ranked = sorted(athletes, key=lambda athlete: _athlete_rank_sort_key(athlete, second_run_phase=second_run_phase))
     leader_value = _leader_time(ranked)
     result: list[tuple[int, AthleteRow, float | None]] = []
 
@@ -858,6 +831,34 @@ def rank_group(athletes: tuple[AthleteRow, ...]) -> list[tuple[int, AthleteRow, 
         result.append((index, athlete, interval))
 
     return result
+
+
+def _athlete_rank_sort_key(athlete: AthleteRow, *, second_run_phase: bool) -> tuple[int, float, int, int]:
+    value = athlete.ranking_value()
+    status = (value.status or "").upper() if value.is_status else ""
+    has_status = status in {"DNS", "DNF", "DSQ"} or value.is_status
+    has_judge_note = bool((athlete.judge_note or "").strip())
+    is_waiting_current_run = _is_waiting_current_run(athlete=athlete, second_run_phase=second_run_phase)
+
+    # Priority: valid time -> judge note -> status -> not started in current run.
+    if value.is_time and not has_judge_note and not is_waiting_current_run:
+        bucket = 0
+    elif has_judge_note and not is_waiting_current_run:
+        bucket = 1
+    elif has_status:
+        bucket = 2
+    else:
+        bucket = 3
+
+    if bucket == 3:
+        return (bucket, float(athlete.sheet_row), athlete.start_number, athlete.sheet_row)
+    return (bucket, value.sort_key(), athlete.start_number, athlete.sheet_row)
+
+
+def _is_waiting_current_run(athlete: AthleteRow, *, second_run_phase: bool) -> bool:
+    if second_run_phase and athlete.runs_count > 1:
+        return athlete.run2.is_empty and not athlete.ranking_value().is_status
+    return athlete.run1.is_empty and not athlete.ranking_value().is_status
 
 
 def _leader_time(athletes: list[AthleteRow]) -> float | None:
@@ -1275,11 +1276,6 @@ def _judge_note_text(athlete: AthleteRow) -> str:
     if not athlete.judge_note:
         return ""
     return f"; Пометка судьи: {athlete.judge_note}"
-
-
-def _has_freeform_judge_note(note: str) -> bool:
-    text = (note or "").strip().upper()
-    return bool(text) and text not in {"DNS", "DNF", "DSQ"}
 
 
 def _highlight_row(athlete: AthleteRow, text: str) -> str:
